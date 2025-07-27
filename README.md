@@ -3,6 +3,7 @@
 This project solves the complexity of managing 50+ Facebook ad accounts with inconsistent timezones, currencies, and infrastructure. We built a scalable analytics system to centralize data, normalize spend, and support real-time reporting via Power BI—without relying on costly enterprise platforms.
 
 Skills Demonstrated: Data Engineering, Pipeline Monitoring, Architecture Design, Python ETL Scripting
+
 ---
 
 ## Problem Statement
