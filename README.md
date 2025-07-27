@@ -25,7 +25,7 @@ Skills Demonstrated: Data Engineering, Pipeline Monitoring, Architecture Design,
 <img width="889" height="496" alt="image" src="https://github.com/user-attachments/assets/f74edada-88d9-4883-bd3b-10f9a22bdb9d" />
 
 
-After evaluating alternatives (`Fivetran`, `Hevodata`), we selected **Coupler.IO** for its simplicity, cost-efficiency, and admin-friendly interface. It allows daily onboarding of new Facebook accounts without engineering overhead.
+After evaluating alternatives (`Fivetran`, `Hevodata`), I selected **Coupler.IO** for its simplicity, cost-efficiency, and admin-friendly interface. It allows daily onboarding of new Facebook accounts without engineering overhead.
 
 #### BigQuery Medallion
 | Layer  | Purpose                                              |
