@@ -54,6 +54,7 @@ Currency conversion uses a historical FX API to ensure ROI metrics reflect true 
 
 7. **Visualize** → Power BI loads from Silver and applies final metrics (Gold)
    <img width="1374" height="552" alt="Power BI Report Cencorde" src="https://github.com/user-attachments/assets/b7f3df8b-2101-43f7-8a19-07f551eae970" />
+   *Data has been faked for confidentiality*
 
 8. **Monitor** → Healthchecks.io tracks hourly ETL script uptime, python script also sends error logs through email
    <img width="882" height="707" alt="healthcheck io" src="https://github.com/user-attachments/assets/97db2a4f-c0e0-4bbd-9ccb-878a7bc67815" />
