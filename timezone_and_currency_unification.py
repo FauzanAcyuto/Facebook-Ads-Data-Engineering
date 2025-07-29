@@ -1,233 +1,499 @@
+
+import os
+import logging
+import time
+from typing import Optional, Dict, Any, List
+from dataclasses import dataclass
+
 import numpy as np
 import pandas as pd
-from sqlalchemy import create_engine
-from google.cloud import bigquery
-from google.oauth2 import service_account
 import pendulum
-import smtplib
-from email.message import EmailMessage
-import ssl
-import time
 import requests
+import smtplib
+import ssl
+from email.message import EmailMessage
+from sqlalchemy import create_engine, Engine
+from google.cloud import bigquery
+from google.cloud.exceptions import NotFound
+from google.oauth2 import service_account
 
-start_time = time.time()
-
-
-# ssl context
-context = ssl.create_default_context()
-
-# Momomedia DB credentials
-sql_engine = create_engine(
-    "mysql+pymysql://xxxxxxx:xxxxxx@xxx.xxx.xxx.xxx:xxx/xxxxxx"
-)
-
-# Big query constants
-gbq_creds = service_account.Credentials.from_service_account_file(
-    "./bigquery-jobrunner-key.json",
-)
-gbq_proj = "xxxx-xxxxx"
-gbq_dataset = "xxxx"
-gbq_table = "xxxxx"  # the destination table for this script
-
-# Big query database objects
-client = bigquery.Client(gbq_proj, credentials=gbq_creds)
-dataset = client.dataset(gbq_dataset)
-table_ref = dataset.table(gbq_table)
-
-# Grab coupler data from Momo GBQ
-adsetdata = pd.read_gbq(
-    "SELECT * FROM `xxxx-xxxx.xxxx.xxxx`",
-    credentials=gbq_creds,
-)
-
-# Clean up the headers and datatypes
-adsetdata.columns = adsetdata.columns.str.lower()
-
-# change the data types for data manipulation
-adsetdata = adsetdata.astype(
-    {
-        "date_start": "str",
-        "date_stop": "str",
-        "account_id": "str",
-        "campaign_name": "str",
-        "ad_set_id": "str",
-        "ad_set_name": "str",
-    }
-)
-
-# order values by date ascending
-adsetdata = adsetdata.sort_values(by=["date_start"])
-adsetdata = adsetdata.rename(
-    columns={"hourly_stats_aggregated_by_advertiser_time_zone": "hour"}
-)
-
-# get the first time value of the hour info and concatenate it with the date to get datetime
-adsetdata["hour"] = adsetdata["hour"].str.split(" - ").str[0]
-adsetdata["source_datetime"] = adsetdata["date_start"] + "T" + adsetdata["hour"]
-
-# get the timezone info
-account_timezones = pd.read_sql(
-    "SELECT adaccount_id, timezone FROM xxxx", sql_engine
-)
-account_timezones["timezone"] = account_timezones["timezone"].str.rsplit(" ").str[-1]
-
-# join the tables
-adsetdata = adsetdata.merge(
-    right=account_timezones, how="left", left_on="account_id", right_on="adaccount_id"
-)
-
-# delete the ad account id from the timezone table
-adsetdata = adsetdata.drop("adaccount_id", axis=1)
-
-# set error variables for email notification
-errorvariable = False
-errortimezones = []
-
-# localize the timezones using pendulum
-for i in adsetdata.index:
+def main():
+    """Main entry point for the application."""
     try:
-        adsetdata.loc[i, "source_datetime"] = pendulum.parse(
-            adsetdata.loc[i, "source_datetime"], tz=adsetdata.loc[i, "timezone"]
+        # Load configuration
+        config = Config.from_environment()
+        
+        # Create and run pipeline
+        pipeline = AdDataPipeline(config)
+        pipeline.run()
+        
+    except Exception as e:
+        logger.error(f"Application failed: {e}")
+        raise
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler('ad_data_pipeline.log'),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger(__name__)
+
+
+@dataclass
+class Config:
+    """Configuration class for the data pipeline."""
+    
+    # Database configuration
+    database_url: str
+    
+    # BigQuery configuration
+    gbq_credentials_path: str
+    gbq_project: str
+    gbq_dataset: str
+    gbq_table: str
+    gbq_source_table: str
+    
+    # Email configuration
+    email_sender: str
+    email_password: str
+    email_receiver: str
+    smtp_server: str = "smtp.gmail.com"
+    smtp_port: int = 465
+    
+    # Health check configuration
+    health_check_url: str
+    
+    @classmethod
+    def from_environment(cls) -> 'Config':
+        """Create configuration from environment variables."""
+        required_vars = [
+            'DATABASE_URL', 'GBQ_CREDENTIALS_PATH', 'GBQ_PROJECT',
+            'GBQ_DATASET', 'GBQ_TABLE', 'GBQ_SOURCE_TABLE',
+            'EMAIL_SENDER', 'EMAIL_PASSWORD', 'EMAIL_RECEIVER',
+            'HEALTH_CHECK_URL'
+        ]
+        
+        missing_vars = [var for var in required_vars if not os.getenv(var)]
+        if missing_vars:
+            raise ValueError(f"Missing required environment variables: {missing_vars}")
+        
+        return cls(
+            database_url=os.getenv('DATABASE_URL'),
+            gbq_credentials_path=os.getenv('GBQ_CREDENTIALS_PATH'),
+            gbq_project=os.getenv('GBQ_PROJECT'),
+            gbq_dataset=os.getenv('GBQ_DATASET'),
+            gbq_table=os.getenv('GBQ_TABLE'),
+            gbq_source_table=os.getenv('GBQ_SOURCE_TABLE'),
+            email_sender=os.getenv('EMAIL_SENDER'),
+            email_password=os.getenv('EMAIL_PASSWORD'),
+            email_receiver=os.getenv('EMAIL_RECEIVER'),
+            health_check_url=os.getenv('HEALTH_CHECK_URL')
         )
-    except:
-        errorvariable = True
-        errortimezones.append(adsetdata.loc[i, "timezone"])
-        adsetdata.loc[i, "source_datetime"] = pendulum.datetime(1999, 1, 1)
-        continue
 
 
-# email variables
-email_sender = "xxxx@gmail.com"
-email_pwd = "xxxxx"  # this is an "app password" for google account
-email_receiver = "xxxxx@gmail.com"
-subject = "Unknown timezone code in Autoloan!!"
-message = f"there is an unknown timezone code or blank timezone code in the Autoloan Adset Cost Update Gsheet\n\nWhich is the following:\n[{','.join(errortimezones)}]"
+class DatabaseConnector:
+    """Handles database connections and operations."""
+    
+    def __init__(self, config: Config):
+        self.config = config
+        self.sql_engine: Optional[Engine] = None
+        self.gbq_client: Optional[bigquery.Client] = None
+        self.gbq_credentials = None
+    
+    def setup_connections(self) -> None:
+        """Initialize database connections."""
+        try:
+            # Setup SQL connection
+            self.sql_engine = create_engine(self.config.database_url)
+            logger.info("SQL engine connection established")
+            
+            # Setup BigQuery connection
+            self.gbq_credentials = service_account.Credentials.from_service_account_file(
+                self.config.gbq_credentials_path
+            )
+            self.gbq_client = bigquery.Client(
+                self.config.gbq_project, 
+                credentials=self.gbq_credentials
+            )
+            logger.info("BigQuery client connection established")
+            
+        except Exception as e:
+            logger.error(f"Failed to setup database connections: {e}")
+            raise
+    
+    def table_exists(self, table_name: str) -> bool:
+        """Check if a BigQuery table exists."""
+        try:
+            table_ref = self.gbq_client.dataset(self.config.gbq_dataset).table(table_name)
+            self.gbq_client.get_table(table_ref)
+            return True
+        except NotFound:
+            return False
+        except Exception as e:
+            logger.error(f"Error checking table existence: {e}")
+            raise
+    
+    def read_sql_query(self, query: str) -> pd.DataFrame:
+        """Execute SQL query and return DataFrame."""
+        try:
+            return pd.read_sql(query, self.sql_engine)
+        except Exception as e:
+            logger.error(f"Failed to execute SQL query: {e}")
+            raise
+    
+    def read_gbq_query(self, query: str) -> pd.DataFrame:
+        """Execute BigQuery query and return DataFrame."""
+        try:
+            return pd.read_gbq(query, credentials=self.gbq_credentials)
+        except Exception as e:
+            logger.error(f"Failed to execute BigQuery query: {e}")
+            raise
+    
+    def write_to_gbq(self, df: pd.DataFrame, table_name: str, 
+                     table_schema: Optional[List[Dict]] = None) -> None:
+        """Write DataFrame to BigQuery."""
+        try:
+            destination = f"{self.config.gbq_project}.{self.config.gbq_dataset}.{table_name}"
+            df.to_gbq(
+                destination,
+                credentials=self.gbq_credentials,
+                if_exists="replace",
+                progress_bar=True,
+                table_schema=table_schema
+            )
+            logger.info(f"Successfully wrote {len(df)} rows to {destination}")
+        except Exception as e:
+            logger.error(f"Failed to write to BigQuery: {e}")
+            raise
+    
+    def close_connections(self) -> None:
+        """Close all database connections."""
+        if self.sql_engine:
+            self.sql_engine.dispose()
+            logger.info("SQL engine connection closed")
 
-# email module
-em = EmailMessage()
-em["From"] = email_sender
-em["To"] = email_receiver
-em["Subject"] = subject
-em.set_content(message)
 
-# send the error email if there is an unknown timezone info
-if errorvariable == True:
-    with smtplib.SMTP_SSL("smtp.gmail.com", 465, context=context) as smtp:
-        smtp.login(email_sender, email_pwd)
-        smtp.sendmail(email_sender, email_receiver, em.as_string())
-adsetdata["pacific_datetime"] = None
+class EmailNotifier:
+    """Handles email notifications."""
+    
+    def __init__(self, config: Config):
+        self.config = config
+        self.ssl_context = ssl.create_default_context()
+    
+    def send_error_notification(self, error_timezones: List[str]) -> None:
+        """Send email notification about timezone errors."""
+        if not error_timezones:
+            return
+        
+        try:
+            subject = "Unknown timezone code in Autoloan!!"
+            message = (
+                f"There is an unknown timezone code or blank timezone code "
+                f"in the Autoloan Adset Cost Update.\n\n"
+                f"Unknown timezones: [{', '.join(error_timezones)}]"
+            )
+            
+            em = EmailMessage()
+            em["From"] = self.config.email_sender
+            em["To"] = self.config.email_receiver
+            em["Subject"] = subject
+            em.set_content(message)
+            
+            with smtplib.SMTP_SSL(
+                self.config.smtp_server, 
+                self.config.smtp_port, 
+                context=self.ssl_context
+            ) as smtp:
+                smtp.login(self.config.email_sender, self.config.email_password)
+                smtp.sendmail(
+                    self.config.email_sender,
+                    self.config.email_receiver,
+                    em.as_string()
+                )
+            
+            logger.info(f"Error notification sent for timezones: {error_timezones}")
+            
+        except Exception as e:
+            logger.error(f"Failed to send email notification: {e}")
 
-# fill in the pacific datetime column
-for i in adsetdata.index:
-    adsetdata.loc[i, "pacific_datetime"] = adsetdata.loc[i, "source_datetime"].in_tz(
-        "US/Pacific"
-    )
+
+class DataProcessor:
+    """Handles data processing operations."""
+    
+    def __init__(self, db_connector: DatabaseConnector, email_notifier: EmailNotifier):
+        self.db = db_connector
+        self.email_notifier = email_notifier
+    
+    def clean_column_names(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Clean and standardize column names."""
+        df = df.copy()
+        df.columns = df.columns.str.lower()
+        return df
+    
+    def standardize_data_types(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Convert DataFrame columns to appropriate data types."""
+        df = df.copy()
+        
+        type_mapping = {
+            "date_start": "str",
+            "date_stop": "str",
+            "account_id": "str",
+            "campaign_name": "str",
+            "ad_set_id": "str",
+            "ad_set_name": "str",
+        }
+        
+        # Only convert columns that exist in the DataFrame
+        existing_columns = {col: dtype for col, dtype in type_mapping.items() 
+                          if col in df.columns}
+        
+        if existing_columns:
+            df = df.astype(existing_columns)
+            logger.info(f"Converted data types for columns: {list(existing_columns.keys())}")
+        
+        return df
+    
+    def process_hour_data(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Extract and process hourly data."""
+        df = df.copy()
+        
+        # Rename the hourly stats column if it exists
+        hourly_col = "hourly_stats_aggregated_by_advertiser_time_zone"
+        if hourly_col in df.columns:
+            df = df.rename(columns={hourly_col: "hour"})
+        
+        # Extract hour information
+        if "hour" in df.columns:
+            df["hour"] = df["hour"].str.split(" - ").str[0]
+            df["source_datetime"] = df["date_start"] + "T" + df["hour"]
+        
+        return df
+    
+    def get_timezone_data(self) -> pd.DataFrame:
+        """Fetch timezone data from the database."""
+        query = "SELECT adaccount_id, timezone FROM account_timezones"
+        
+        try:
+            timezone_df = self.db.read_sql_query(query)
+            # Clean timezone format
+            timezone_df["timezone"] = timezone_df["timezone"].str.rsplit(" ").str[-1]
+            logger.info(f"Retrieved {len(timezone_df)} timezone records")
+            return timezone_df
+        except Exception as e:
+            logger.error(f"Failed to fetch timezone data: {e}")
+            raise
+    
+    def parse_datetime_with_timezone(self, row: pd.Series) -> pendulum.DateTime:
+        """Safely parse datetime with timezone information."""
+        try:
+            return pendulum.parse(row['source_datetime'], tz=row['timezone'])
+        except (pendulum.ParsingException, ValueError, TypeError) as e:
+            logger.warning(f"Failed to parse datetime for timezone {row.get('timezone')}: {e}")
+            return pendulum.datetime(1999, 1, 1)
+    
+    def process_timezones(self, df: pd.DataFrame) -> tuple[pd.DataFrame, List[str]]:
+        """Process timezone data and convert to Pacific time."""
+        df = df.copy()
+        error_timezones = []
+        
+        # Get timezone data
+        timezone_df = self.get_timezone_data()
+        
+        # Merge with main dataset
+        df = df.merge(
+            timezone_df,
+            how="left",
+            left_on="account_id",
+            right_on="adaccount_id"
+        ).drop("adaccount_id", axis=1)
+        
+        # Parse datetimes with timezone - vectorized approach with error tracking
+        def parse_with_error_tracking(row):
+            parsed_dt = self.parse_datetime_with_timezone(row)
+            if parsed_dt.year == 1999:  # Our error indicator
+                error_timezones.append(row.get('timezone', 'Unknown'))
+            return parsed_dt
+        
+        df['source_datetime'] = df.apply(parse_with_error_tracking, axis=1)
+        
+        # Convert to Pacific time
+        df['pacific_datetime'] = df['source_datetime'].apply(
+            lambda dt: dt.in_tz("US/Pacific") if hasattr(dt, 'in_tz') else dt
+        )
+        
+        # Convert datetime objects to strings for SQL compatibility
+        df['source_datetime'] = df['source_datetime'].astype(str)
+        df['pacific_datetime'] = df['pacific_datetime'].astype(str)
+        
+        # Convert amount_spend to float if it exists
+        if 'amount_spend' in df.columns:
+            df['amount_spend'] = pd.to_numeric(df['amount_spend'], errors='coerce')
+        
+        # Remove duplicates from error list
+        error_timezones = list(set([tz for tz in error_timezones if tz and tz != 'Unknown']))
+        
+        logger.info(f"Processed {len(df)} records with {len(error_timezones)} timezone errors")
+        return df, error_timezones
+    
+    def merge_datasets(self, new_data: pd.DataFrame, historical_data: pd.DataFrame) -> pd.DataFrame:
+        """Merge new data with historical data, prioritizing new data."""
+        # Add source labels
+        new_data = new_data.copy()
+        historical_data = historical_data.copy()
+        
+        new_data['source'] = '1. Coupler'
+        historical_data['source'] = '2. GBQ'
+        
+        # Ensure consistent data types
+        for df in [new_data, historical_data]:
+            df['date_start'] = df['date_start'].astype(str)
+            df['date_stop'] = df['date_stop'].astype(str)
+            df['source_datetime'] = df['source_datetime'].astype(str)
+            if 'amount_spend' in df.columns:
+                df['amount_spend'] = pd.to_numeric(df['amount_spend'], errors='coerce')
+        
+        # Combine datasets
+        merged = pd.concat([new_data, historical_data], ignore_index=True)
+        
+        # Sort by source to prioritize Coupler data
+        merged = merged.sort_values('source', ascending=True)
+        
+        # Remove duplicates, keeping first occurrence (Coupler data)
+        merged = merged.drop_duplicates(
+            subset=['source_datetime', 'account_id', 'ad_set_id'],
+            keep='first'
+        )
+        
+        # Clean up and sort
+        merged = merged.drop('source', axis=1)
+        merged = merged.sort_values('source_datetime').reset_index(drop=True)
+        
+        logger.info(f"Merged dataset contains {len(merged)} records")
+        return merged
 
 
-# change the timezone aware timestamp info to string so SQL can process it
-adsetdata = adsetdata.astype(
-    {
-        "source_datetime": "str",
-        "pacific_datetime": "str",
-        "amount_spend": "float64",
-    }
-)
+class HealthChecker:
+    """Handles health check notifications."""
+    
+    def __init__(self, config: Config):
+        self.config = config
+    
+    def ping_health_check(self) -> None:
+        """Send health check ping."""
+        try:
+            response = requests.get(self.config.health_check_url, timeout=10)
+            response.raise_for_status()
+            logger.info("Health check ping successful")
+        except requests.RequestException as e:
+            logger.error(f"Health check ping failed: {e}")
 
 
-# define function for checking if a table exists
-def if_tbl_exists(client, table_ref):
-    from google.cloud.exceptions import NotFound
-
-    try:
-        client.get_table(table_ref)
-        return True
-    except NotFound:
-        return False
-
-
-# check if the table exists in the database, if not then insert the data as is
-if not if_tbl_exists(client, table_ref):
-    adsetdata.to_gbq(
-        f"{gbq_proj}.{gbq_dataset}.{gbq_table}",
-        credentials=gbq_creds,
-        if_exists="replace",
-        progress_bar=True,
-        table_schema=[
+class AdDataPipeline:
+    """Main pipeline orchestrator."""
+    
+    def __init__(self, config: Config):
+        self.config = config
+        self.db_connector = DatabaseConnector(config)
+        self.email_notifier = EmailNotifier(config)
+        self.data_processor = DataProcessor(self.db_connector, self.email_notifier)
+        self.health_checker = HealthChecker(config)
+        self.start_time = time.time()
+    
+    def run(self) -> None:
+        """Execute the complete data pipeline."""
+        try:
+            logger.info("Starting ad data pipeline")
+            
+            # Setup connections
+            self.db_connector.setup_connections()
+            
+            # Load source data
+            source_data = self._load_source_data()
+            
+            # Process the data
+            processed_data, error_timezones = self._process_data(source_data)
+            
+            # Send error notifications if needed
+            if error_timezones:
+                self.email_notifier.send_error_notification(error_timezones)
+            
+            # Handle data insertion/merging
+            self._handle_data_output(processed_data)
+            
+            # Send health check
+            self.health_checker.ping_health_check()
+            
+            # Log completion
+            execution_time = time.time() - self.start_time
+            logger.info(f"Pipeline completed successfully in {execution_time:.2f} seconds")
+            
+        except Exception as e:
+            logger.error(f"Pipeline failed: {e}")
+            raise
+        finally:
+            self.db_connector.close_connections()
+    
+    def _load_source_data(self) -> pd.DataFrame:
+        """Load data from the source BigQuery table."""
+        query = f"SELECT * FROM `{self.config.gbq_source_table}`"
+        return self.db_connector.read_gbq_query(query)
+    
+    def _process_data(self, raw_data: pd.DataFrame) -> tuple[pd.DataFrame, List[str]]:
+        """Process the raw data through all transformation steps."""
+        # Clean and standardize
+        data = self.data_processor.clean_column_names(raw_data)
+        data = self.data_processor.standardize_data_types(data)
+        
+        # Sort by date
+        data = data.sort_values('date_start')
+        
+        # Process hourly data
+        data = self.data_processor.process_hour_data(data)
+        
+        # Process timezones
+        data, error_timezones = self.data_processor.process_timezones(data)
+        
+        return data, error_timezones
+    
+    def _handle_data_output(self, processed_data: pd.DataFrame) -> None:
+        """Handle the final data output to BigQuery."""
+        table_schema = [
             {"name": "date_start", "type": "DATE"},
             {"name": "date_stop", "type": "DATE"},
-        ],
-    )
-    print("table not found, inserting data as is")
-    end_time = time.time()
-    print(end_time - start_time)
-    exit()
-else:
-    print("table is found, continuing the data transformation")
+        ]
+        
+        # Check if destination table exists
+        if not self.db_connector.table_exists(self.config.gbq_table):
+            logger.info("Destination table not found, creating new table")
+            self.db_connector.write_to_gbq(
+                processed_data, 
+                self.config.gbq_table,
+                table_schema
+            )
+        else:
+            logger.info("Destination table found, merging with historical data")
+            
+            # Load historical data
+            historical_query = f"SELECT * FROM `{self.config.gbq_project}.{self.config.gbq_dataset}.{self.config.gbq_table}`"
+            historical_data = self.db_connector.read_gbq_query(historical_query)
+            
+            # Merge datasets
+            merged_data = self.data_processor.merge_datasets(processed_data, historical_data)
+            
+            # Write merged data
+            self.db_connector.write_to_gbq(
+                merged_data,
+                self.config.gbq_table,
+                table_schema
+            )
 
 
-# grab the historical dataset
-gbq_df = pd.read_gbq(
-    "SELECT * FROM `xxxx-xxxx.xxxx.xxxx`",
-    credentials=gbq_creds,
-)
 
-# set the source info
-adsetdata["source"] = "1. Coupler"
-gbq_df["source"] = "2. GBQ"
 
-# change the datatype of the dates to string
-gbq_df = gbq_df.astype({"date_start": "str", "date_stop": "str"})
 
-# combine the table
-merged_table = pd.concat([adsetdata, gbq_df]).astype(
-    dtype={
-        "date_start": "str",
-        "date_stop": "str",
-        "source_datetime": "str",
-        "amount_spend": "float",
-    }
-)
-
-# order the table by the source to prioritize coupler source
-merged_table = merged_table.sort_values(by="source", ascending=True)
-
-# only keep unique datetime + campaign id + ad set id
-merged_table = merged_table.drop_duplicates(
-    subset=["source_datetime", "account_id", "ad_set_id"], keep="first"
-)
-
-# only keep unique datetime + campaign name + ad set name
-# merged_table = merged_table.drop_duplicates(
-#     subset=["source_datetime", "campaign_name", "ad_set_id"], keep="first"
-# )
-
-# sort the values by datetime and reset index
-merged_table = merged_table.sort_values(by=["source_datetime"]).reset_index(drop=True)
-
-# delete the source column
-merged_table = merged_table.drop("source", axis=1)
-
-# insert the merged table to gbq
-merged_table.to_gbq(
-    f"{gbq_proj}.{gbq_dataset}.{gbq_table}",
-    credentials=gbq_creds,
-    if_exists="replace",
-    progress_bar=True,
-    table_schema=[
-        {"name": "date_start", "type": "DATE"},
-        {"name": "date_stop", "type": "DATE"},
-    ],
-)
-
-# ping health checks
-try:
-    requests.get("https://hc-ping.com/xxxxx-xxxxx-xxxxx-xxxxx-xxxxx", timeout=10)
-except requests.RequestException as e:
-    # Log ping failure here...
-    print("Ping failed: %s" % e)
-
-# dispose sql engine
-sql_engine.dispose()
-
-end_time = time.time()
-print(end_time - start_time)
+if __name__ == "__main__":
+    main()
